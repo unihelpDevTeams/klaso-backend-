@@ -22,9 +22,20 @@ The response contains the public `url` and R2 object `key`.
 Keep the R2 credentials in this backend's `.env`; never put them in the Expo
 app's environment.
 
+## Admin email allowlist
+
+Set `ADMIN_EMAILS` in the backend `.env` to one or more comma-separated email
+addresses. Admin access is granted only after the account verifies its email.
+The backend verifies the Firebase ID token, applies the admin custom claim, and
+returns the result without sending the allowlist to the app.
+
+Set `FIREBASE_PROJECT_ID` and provide `FIREBASE_SERVICE_ACCOUNT_JSON` for local
+development, or configure Application Default Credentials in production. The
+service account must be allowed to verify Firebase ID tokens and set custom
+user claims.
+
 ## App environment
 
 In `klaso/.env`, set `EXPO_PUBLIC_API_URL` to this backend's reachable URL and
-`EXPO_PUBLIC_ADMIN_EMAIL` to the exact email that should be treated as the
-configured admin. Expo `EXPO_PUBLIC_` values are bundled into the app and are
-not secrets. Use a verified account for this email.
+set the Firebase `EXPO_PUBLIC_` values. No admin email list or Firebase service
+account credentials belong in the app environment.

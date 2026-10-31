@@ -1,4 +1,7 @@
 import { randomUUID } from 'crypto';
+import { applicationDefault, cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
+import { getAuth as getAdminAuth } from 'firebase-admin/auth';
 import { S3Client, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import cors from 'cors';
@@ -40,6 +43,21 @@ const requiredR2Settings = [
   'R2_BUCKET_NAME',
   'R2_PUBLIC_URL',
 ];
+const firebaseAdminApp = getApps()[0] || initializeApp({
+  credential: process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+    ? cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON))
+    : applicationDefault(),
+  projectId: process.env.FIREBASE_PROJECT_ID || undefined,
+});
+const firebaseAuth = getAdminAuth(firebaseAdminApp);
+const firebaseDb = getFirestore(firebaseAdminApp);
+
+function getConfiguredAdminEmails() {
+  return (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean);
+}
 
 const allowedMimeTypes = new Set([
   'image/jpeg',
@@ -89,8 +107,8 @@ function getObjectUrl(key) {
   return `${process.env.R2_PUBLIC_URL.replace(/\/+$/, '')}/${key}`;
 }
 
-async function storeInR2(file, folder) {
-  const key = `${folder}/${randomUUID()}${path.extname(file.originalname).toLowerCase()}`;
+async function storeInR2(file, folder, userId) {
+  const key = `${folder}/${userId}/${randomUUID()}${path.extname(file.originalname).toLowerCase()}`;
   const uploadTask = new Upload({
     client: r2Client,
     params: {
@@ -139,21 +157,111 @@ function requireR2Configuration(res) {
   return false;
 }
 
+async function authenticateFirebaseUser(req, res, next) {
+  const authorization = req.get('authorization') || '';
+  const tokenMatch = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!tokenMatch) {
+    return res.status(401).json({ error: 'Authentication is required.' });
+  }
+
+  try {
+    req.auth = await firebaseAuth.verifyIdToken(tokenMatch[1]);
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'Authentication token is invalid or expired.' });
+  }
+}
+
+async function requireLessonCreator(req, res, next) {
+  if (req.auth.admin === true) return next();
+
+  try {
+    const userSnapshot = await firebaseDb.collection('users').doc(req.auth.uid).get();
+    const userProfile = userSnapshot.data();
+    if (userProfile?.role === 'tutor' && userProfile.approved === true) {
+      return next();
+    }
+
+    return res.status(403).json({ error: 'Only verified tutors and admins can upload lessons.' });
+  } catch (error) {
+    console.error('Unable to verify lesson creator permissions:', error);
+    return res.status(500).json({ error: 'Unable to verify lesson creator permissions.' });
+  }
+}
+
+async function authorizeMediaFolder(req, res, next) {
+  const folder = getUploadFolder(req.query.folder);
+  if (!folder) {
+    return res.status(400).json({ error: 'Unsupported upload folder.' });
+  }
+
+  if (folder === 'klaso/profiles' || req.auth.admin === true) {
+    req.uploadFolder = folder;
+    return next();
+  }
+
+  return requireLessonCreator(req, res, () => {
+    req.uploadFolder = folder;
+    return next();
+  });
+}
+
 app.get('/', (_req, res) => {
   res.json({ ok: true, message: 'Klaso backend is running.' });
 });
 
-app.post('/api/upload-media', upload.single('file'), async (req, res) => {
+app.post('/api/admin/verify', async (req, res) => {
+  const authorization = req.get('authorization') || '';
+  const tokenMatch = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!tokenMatch) {
+    return res.status(401).json({ error: 'Authentication is required.' });
+  }
+
+  let decodedToken;
+  try {
+    decodedToken = await firebaseAuth.verifyIdToken(tokenMatch[1]);
+  } catch {
+    return res.status(401).json({ error: 'Authentication token is invalid or expired.' });
+  }
+
+  try {
+    const userRecord = await firebaseAuth.getUser(decodedToken.uid);
+    const email = userRecord.email?.trim().toLowerCase();
+    const isConfiguredAdmin =
+      typeof email === 'string' && getConfiguredAdminEmails().includes(email);
+    const isAdmin = isConfiguredAdmin && userRecord.emailVerified === true;
+    const customClaims = { ...userRecord.customClaims };
+
+    if (isAdmin) {
+      customClaims.admin = true;
+    } else {
+      delete customClaims.admin;
+    }
+
+    if (Boolean(userRecord.customClaims?.admin) !== isAdmin) {
+      await firebaseAuth.setCustomUserClaims(decodedToken.uid, customClaims);
+    }
+
+    return res.json({
+      isAdmin,
+      emailVerificationRequired: isConfiguredAdmin && !userRecord.emailVerified,
+    });
+  } catch (error) {
+    console.error('Unable to verify configured admin access:', error);
+    return res.status(500).json({ error: 'Unable to verify admin access.' });
+  }
+});
+
+app.post(
+  '/api/upload-media',
+  authenticateFirebaseUser,
+  authorizeMediaFolder,
+  upload.single('file'),
+  async (req, res) => {
   const file = req.file;
 
   if (!file) {
     return res.status(400).json({ error: 'No file provided.' });
-  }
-
-  const folder = getUploadFolder(req.body.folder);
-  if (!folder) {
-    await removeTemporaryFile(file);
-    return res.status(400).json({ error: 'Unsupported upload folder.' });
   }
 
   if (!requireR2Configuration(res)) {
@@ -162,7 +270,7 @@ app.post('/api/upload-media', upload.single('file'), async (req, res) => {
   }
 
   try {
-    const result = await storeInR2(file, folder);
+    const result = await storeInR2(file, req.uploadFolder, req.auth.uid);
     return res.json({ ok: true, ...result });
   } catch (error) {
     console.error('R2 media upload failed:', error);
@@ -170,12 +278,19 @@ app.post('/api/upload-media', upload.single('file'), async (req, res) => {
   } finally {
     await removeTemporaryFile(file);
   }
-});
+  }
+);
 
-app.delete('/api/delete-media', async (req, res) => {
+app.delete('/api/delete-media', authenticateFirebaseUser, async (req, res) => {
   const key = req.body?.key;
 
-  if (typeof key !== 'string' || !key.startsWith('klaso/') || key.includes('..')) {
+  const escapedUserId = req.auth.uid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const ownedObjectPrefix = `^klaso/(lessons|profiles|media)/${escapedUserId}/`;
+  const canDeleteObject =
+    typeof key === 'string' &&
+    !key.includes('..') &&
+    (new RegExp(ownedObjectPrefix).test(key) || req.auth.admin === true);
+  if (!canDeleteObject) {
     return res.status(400).json({ error: 'A valid R2 object key is required.' });
   }
 
@@ -195,7 +310,12 @@ app.delete('/api/delete-media', async (req, res) => {
   }
 });
 
-app.post('/api/upload-lesson', upload.single('thumbnail'), async (req, res) => {
+app.post(
+  '/api/upload-lesson',
+  authenticateFirebaseUser,
+  requireLessonCreator,
+  upload.single('thumbnail'),
+  async (req, res) => {
   const { title, description, hashtags, subject, level, duration, price } = req.body;
 
   if (!title || !description || !subject) {
@@ -216,7 +336,7 @@ app.post('/api/upload-lesson', upload.single('thumbnail'), async (req, res) => {
   const folder = getUploadFolder('klaso/lessons');
 
   try {
-    const result = req.file ? await storeInR2(req.file, folder) : null;
+    const result = req.file ? await storeInR2(req.file, folder, req.auth.uid) : null;
     return res.json({
       ok: true,
       lesson: {
@@ -230,7 +350,8 @@ app.post('/api/upload-lesson', upload.single('thumbnail'), async (req, res) => {
         thumbnailUrl: result?.url || req.body.thumbnailUrl || null,
         thumbnailKey: result?.key || null,
       },
-    });
+      }
+    );
   } catch (error) {
     console.error('R2 lesson upload failed:', error);
     return res.status(500).json({ error: 'Lesson upload failed.' });
