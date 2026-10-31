@@ -252,6 +252,51 @@ app.post('/api/admin/verify', async (req, res) => {
   }
 });
 
+app.get('/api/tutor/insights', authenticateFirebaseUser, async (req, res) => {
+  try {
+    const userSnapshot = await firebaseDb.collection('users').doc(req.auth.uid).get();
+    const userProfile = userSnapshot.data();
+    if (userProfile?.role !== 'tutor' || userProfile.approved !== true) {
+      return res.status(403).json({ error: 'Only verified tutors can view tutorial insights.' });
+    }
+
+    const courseSnapshot = await firebaseDb
+      .collection('courses')
+      .where('createdBy', '==', req.auth.uid)
+      .get();
+    const courses = await Promise.all(courseSnapshot.docs.map(async (courseDocument) => {
+      const enrollmentSnapshot = await firebaseDb
+        .collection('enrollments')
+        .where('courseId', '==', courseDocument.id)
+        .get();
+      const course = courseDocument.data();
+
+      return {
+        id: courseDocument.id,
+        title: course.title || '',
+        subject: course.subject || '',
+        level: course.level || '',
+        rating: typeof course.rating === 'number' ? course.rating : null,
+        enrollmentCount: enrollmentSnapshot.size,
+      };
+    }));
+
+    const ratedCourses = courses.filter((course) => course.rating !== null);
+    return res.json({
+      courses,
+      summary: {
+        enrollments: courses.reduce((total, course) => total + course.enrollmentCount, 0),
+        averageRating: ratedCourses.length
+          ? ratedCourses.reduce((total, course) => total + course.rating, 0) / ratedCourses.length
+          : null,
+      },
+    });
+  } catch (error) {
+    console.error('Unable to load tutor insights:', error);
+    return res.status(500).json({ error: 'Unable to load tutor insights.' });
+  }
+});
+
 app.post(
   '/api/upload-media',
   authenticateFirebaseUser,
