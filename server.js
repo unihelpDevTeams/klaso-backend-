@@ -11,6 +11,7 @@ import {
   serializeBankAccount,
   validateBankAccountInput,
 } from './bankAccountUtils.js';
+import { collectOwnedTutorialMediaKeys } from './tutorialDeletionUtils.js';
 import { applicationDefault, cert, getApps, initializeApp } from 'firebase-admin/app';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
@@ -630,65 +631,6 @@ async function storeInR2(file, folder, userId) {
   };
 }
 
-function collectOwnedCourseMediaKeys(courseData, lessonDocuments, tutorId) {
-  const allowedPrefixes = [
-    `klaso/lessons/${tutorId}/`,
-    `klaso/media/${tutorId}/`,
-  ];
-  const mediaKeys = new Set();
-  const addKey = (value) => {
-    if (typeof value !== 'string' || !value.trim()) return;
-    const key = value.trim();
-    if (
-      key.includes('..')
-      || key.includes('\\')
-      || !allowedPrefixes.some((prefix) => key.startsWith(prefix))
-    ) {
-      const error = new Error('A tutorial references media that is not owned by this tutor.');
-      error.statusCode = 409;
-      throw error;
-    }
-    mediaKeys.add(key);
-  };
-  const addUrl = (value) => {
-    if (typeof value !== 'string' || !value.trim() || !process.env.R2_PUBLIC_URL) return;
-    let mediaUrl;
-    let publicUrl;
-    try {
-      mediaUrl = new URL(value);
-      publicUrl = new URL(process.env.R2_PUBLIC_URL);
-    } catch {
-      return;
-    }
-    if (mediaUrl.origin !== publicUrl.origin) return;
-
-    const basePath = publicUrl.pathname.replace(/\/+$/, '');
-    if (basePath && !mediaUrl.pathname.startsWith(`${basePath}/`)) return;
-    const encodedKey = basePath
-      ? mediaUrl.pathname.slice(basePath.length + 1)
-      : mediaUrl.pathname.replace(/^\/+/, '');
-    let key;
-    try {
-      key = decodeURIComponent(encodedKey);
-    } catch {
-      const error = new Error('A tutorial contains an invalid media URL.');
-      error.statusCode = 409;
-      throw error;
-    }
-    addKey(key);
-  };
-  const addAssets = (asset) => {
-    if (!asset || typeof asset !== 'object') return;
-    for (const keyField of ['videoKey', 'thumbnailKey']) addKey(asset[keyField]);
-    for (const urlField of ['videoUrl', 'thumbnailUrl', 'image', 'imageUrl']) addUrl(asset[urlField]);
-  };
-
-  addAssets(courseData);
-  if (Array.isArray(courseData.curriculum)) courseData.curriculum.forEach(addAssets);
-  lessonDocuments.forEach((lessonDocument) => addAssets(lessonDocument.data()));
-  return [...mediaKeys];
-}
-
 async function deleteFirestoreDocuments(documentReferences) {
   const uniqueReferences = [...new Map(documentReferences.map((reference) => [reference.path, reference])).values()];
   for (let offset = 0; offset < uniqueReferences.length; offset += 450) {
@@ -819,6 +761,8 @@ app.post('/api/admin/verify', async (req, res) => {
 
 app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) => {
   const tutorialId = String(req.body?.tutorialId || req.body?.courseId || '').trim();
+  let initializingTransactionRef = null;
+  let initializationRegistered = false;
   if (!tutorialId) {
     return res.status(400).json({ error: 'A valid tutorial ID is required.' });
   }
@@ -859,6 +803,7 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
 
     const txRef = generateTxRef('KLS');
     const transactionDocRef = getTransactionDocRef(txRef);
+    initializingTransactionRef = transactionDocRef;
     const tutorId = String(courseData.createdBy || courseData.tutorId || courseData.tutor?.uid || '');
     const redirectUrl = process.env.FLW_REDIRECT_URL || 'klaso://checkout';
     await firebaseDb.runTransaction(async (transaction) => {
@@ -885,6 +830,7 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
         redirectUrl,
       });
     });
+    initializationRegistered = true;
 
     const payload = {
       tx_ref: txRef,
@@ -961,6 +907,17 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
     });
   } catch (error) {
     console.error('Unable to initialize payment:', error);
+    if (initializationRegistered && initializingTransactionRef) {
+      try {
+        await initializingTransactionRef.set({
+          status: 'failed',
+          failureReason: 'Checkout initialization did not complete.',
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      } catch (statusError) {
+        console.error('Unable to record failed checkout initialization:', statusError.message);
+      }
+    }
     return res.status(error.statusCode || 500).json({ error: error.message || 'Unable to initialize payment.' });
   }
 });
@@ -1772,6 +1729,8 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
   const purchasesQuery = firebaseDb.collection('purchases').where('tutorialId', '==', courseId);
   const transactionsQuery = firebaseDb.collection('transactions').where('tutorialId', '==', courseId);
   let courseData;
+  let deletionLockSet = false;
+  let mediaCleanupStarted = false;
 
   try {
     await firebaseDb.runTransaction(async (transaction) => {
@@ -1793,14 +1752,14 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
         error.statusCode = 404;
         throw error;
       }
-      if (!purchasesSnapshot.empty) {
+      if (candidate.deletionStatus !== 'deleting' && !purchasesSnapshot.empty) {
         const error = new Error('This tutorial has purchases and cannot be deleted.');
         error.statusCode = 409;
         throw error;
       }
 
       const terminalStatuses = new Set(['failed', 'cancelled', 'expired']);
-      const hasActivePayment = transactionsSnapshot.docs.some((transactionDocument) =>
+      const hasActivePayment = candidate.deletionStatus !== 'deleting' && transactionsSnapshot.docs.some((transactionDocument) =>
         !terminalStatuses.has(String(transactionDocument.data().status || '').toLowerCase())
       );
       if (hasActivePayment) {
@@ -1817,6 +1776,7 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
         updatedAt: FieldValue.serverTimestamp(),
       });
     });
+    deletionLockSet = true;
 
     const lessonDocumentsById = new Map();
     const linkedLessons = await firebaseDb
@@ -1835,10 +1795,18 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
       const lessonOwner = lessonDocument.data().createdBy;
       return lessonOwner && lessonOwner !== req.auth.uid;
     })) {
-      return res.status(409).json({ error: 'A linked lesson is owned by another tutor and cannot be deleted.' });
+      const error = new Error('A linked lesson is owned by another tutor and cannot be deleted.');
+      error.statusCode = 409;
+      throw error;
     }
 
-    const mediaKeys = collectOwnedCourseMediaKeys(courseData, lessonDocuments, req.auth.uid);
+    const mediaKeys = collectOwnedTutorialMediaKeys(
+      courseData,
+      lessonDocuments.map((lessonDocument) => lessonDocument.data()),
+      req.auth.uid,
+      process.env.R2_PUBLIC_URL
+    );
+    mediaCleanupStarted = true;
     const mediaResults = await Promise.allSettled(mediaKeys.map((key) =>
       r2Client.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key }))
     ));
@@ -1852,9 +1820,14 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
     }
 
     const reviewSnapshot = await courseRef.collection('reviews').get();
+    const savedCoursesSnapshot = await firebaseDb
+      .collection('saved_courses')
+      .where('courseId', '==', courseId)
+      .get();
     await deleteFirestoreDocuments([
       ...lessonDocuments.map((lessonDocument) => lessonDocument.ref),
       ...reviewSnapshot.docs.map((reviewDocument) => reviewDocument.ref),
+      ...savedCoursesSnapshot.docs.map((savedCourse) => savedCourse.ref),
       courseRef,
     ]);
 
@@ -1865,6 +1838,18 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
       deletedMediaCount: mediaKeys.length,
     });
   } catch (error) {
+    if (deletionLockSet && !mediaCleanupStarted) {
+      try {
+        await courseRef.update({
+          deletionStatus: FieldValue.delete(),
+          deletionStartedBy: FieldValue.delete(),
+          deletionStartedAt: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      } catch (unlockError) {
+        console.error('Unable to release failed tutorial deletion lock:', unlockError.message, { courseId });
+      }
+    }
     console.error('Unable to delete tutor tutorial:', error.message, { courseId });
     return res.status(error.statusCode || 500).json({ error: error.message || 'Unable to delete this tutorial.' });
   }
