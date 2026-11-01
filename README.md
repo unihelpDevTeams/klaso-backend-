@@ -34,6 +34,25 @@ development, or configure Application Default Credentials in production. The
 service account must be allowed to verify Firebase ID tokens and set custom
 user claims.
 
+## Flutterwave tutor payout accounts
+
+Keep `FLW_SECRET_KEY` in the backend environment only. The app uses the
+authenticated `/api/wallet/banks`, `/api/wallet/banks/resolve`, and
+`/api/wallet/bank-accounts` routes. Bank resolution follows Flutterwave's
+documented `POST /v3/accounts/resolve` request with `account_bank`,
+`account_number`, and `country: "NG"`. Bank codes are validated against the
+server-fetched `/v3/banks/NG` list.
+
+Set `BANK_ACCOUNT_ENCRYPTION_KEY` to a generated 32-byte (64 hexadecimal
+character) key in every backend environment. Keep it stable and backed up; it
+encrypts account numbers at rest and fingerprints duplicate accounts. Existing
+legacy plaintext bank records are encrypted when the tutor next loads saved
+accounts. API responses expose only masked account numbers.
+
+Flutterwave sandbox account resolution only supports Flutterwave test account
+data. Use a valid sandbox bank/account pair in test mode; live-account
+verification requires live Flutterwave credentials.
+
 ## App environment
 
 In `klaso/.env`, set `EXPO_PUBLIC_API_URL` to this backend's reachable URL and

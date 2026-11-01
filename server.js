@@ -1,4 +1,16 @@
 import crypto, { randomUUID } from 'crypto';
+import {
+  decryptAccountNumber,
+  encryptAccountNumber,
+  fingerprintAccountNumber,
+  getAccountHolderName,
+  maskAccountNumber,
+  normalizeBankList,
+  parseFlutterwaveBankList,
+  requireBankEncryptionKey,
+  serializeBankAccount,
+  validateBankAccountInput,
+} from './bankAccountUtils.js';
 import { applicationDefault, cert, getApps, initializeApp } from 'firebase-admin/app';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
@@ -236,7 +248,8 @@ async function recordSuccessfulPurchase(transactionData, flutterwaveData) {
   const studentId = transactionData.studentId;
   const tutorialId = transactionData.tutorialId;
   const tutorId = transactionData.tutorId;
-  const courseDoc = await firebaseDb.collection('courses').doc(tutorialId).get();
+  const courseRef = firebaseDb.collection('courses').doc(tutorialId);
+  const courseDoc = await courseRef.get();
   const courseData = courseDoc.exists ? courseDoc.data() || {} : {};
   const amountPaid = Number(transactionData.amount);
   const commission = Number((amountPaid * KLASO_COMMISSION_RATE).toFixed(2));
@@ -274,13 +287,25 @@ async function recordSuccessfulPurchase(transactionData, flutterwaveData) {
   const enrollmentRef = firebaseDb.collection('enrollments').doc(`${studentId}_${tutorialId}`);
 
   await firebaseDb.runTransaction(async (transaction) => {
-    const walletDoc = await transaction.get(walletRef);
+    const [walletDoc, currentCourseDoc] = await Promise.all([
+      transaction.get(walletRef),
+      transaction.get(courseRef),
+    ]);
+    if (currentCourseDoc.exists && currentCourseDoc.data().deletionStatus === 'deleting') {
+      throw new Error('The tutorial is being deleted; purchase finalization must be retried.');
+    }
     const walletData = walletDoc.exists ? walletDoc.data() || {} : {};
     const existingTotal = Number(walletData.totalEarnings || 0);
     const existingPending = Number(walletData.pendingBalance || 0);
     const existingAvailable = Number(walletData.availableBalance || 0);
 
     transaction.set(purchaseDocRef, purchasePayload, { merge: false });
+    if (currentCourseDoc.exists) {
+      transaction.update(courseRef, {
+        lastPurchasedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
     transaction.set(
       walletRef,
       {
@@ -491,7 +516,42 @@ async function requireTutorAccess(req, res, next) {
 }
 
 function getBankListUrl(countryCode = 'NG') {
-  return countryCode === 'NG' ? `${FLUTTERWAVE_BASE_URL}/banks/NG` : `${FLUTTERWAVE_BASE_URL}/banks/${countryCode}`;
+  const country = String(countryCode || 'NG').trim().toUpperCase();
+  return `${FLUTTERWAVE_BASE_URL}/banks/${encodeURIComponent(country)}`;
+}
+
+const flutterwaveBankCache = new Map();
+
+async function getFlutterwaveBanks(countryCode = 'NG') {
+  const country = String(countryCode || 'NG').trim().toUpperCase();
+  const cached = flutterwaveBankCache.get(country);
+  if (cached && cached.expiresAt > Date.now()) return cached.request;
+
+  const request = (async () => {
+    if (!process.env.FLW_SECRET_KEY) {
+      const error = new Error('Flutterwave is not configured on this server.');
+      error.statusCode = 503;
+      throw error;
+    }
+
+    const response = await fetch(getBankListUrl(country), {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
+        Accept: 'application/json',
+      },
+    });
+    const payload = await response.json().catch(() => ({}));
+    return parseFlutterwaveBankList(response.ok, payload);
+  })();
+
+  flutterwaveBankCache.set(country, { request, expiresAt: Date.now() + 5 * 60 * 1000 });
+  try {
+    return await request;
+  } catch (error) {
+    flutterwaveBankCache.delete(country);
+    throw error;
+  }
 }
 
 function getTransferFee(amount, settings) {
@@ -500,13 +560,12 @@ function getTransferFee(amount, settings) {
   return Number(Math.min(baseFee, amount * 0.01).toFixed(2));
 }
 
-function maskAccountNumber(accountNumber) {
-  const value = String(accountNumber || '').trim();
-  if (!value) return '';
-  return value.length <= 4 ? value : `••••${value.slice(-4)}`;
-}
-
 async function resolveFlutterwaveBankAccount(bankCode, accountNumber, countryCode = 'NG') {
+  const country = String(countryCode || 'NG').trim().toUpperCase();
+  const banks = await getFlutterwaveBanks(country);
+  const validatedInput = validateBankAccountInput(bankCode, accountNumber, banks, country);
+  const { bank, accountNumber: normalizedAccountNumber } = validatedInput;
+
   const response = await fetch(`${FLUTTERWAVE_BASE_URL}/accounts/resolve`, {
     method: 'POST',
     headers: {
@@ -515,18 +574,21 @@ async function resolveFlutterwaveBankAccount(bankCode, accountNumber, countryCod
       Accept: 'application/json',
     },
     body: JSON.stringify({
-      account_number: String(accountNumber || '').trim(),
-      account_bank: String(bankCode || '').trim(),
-      country: String(countryCode || 'NG').trim(),
+      account_number: normalizedAccountNumber,
+      account_bank: bank.code,
+      country,
     }),
   });
 
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.status !== 'success') {
-    throw new Error(payload?.message || 'Unable to resolve the bank account from Flutterwave.');
+  const accountName = getAccountHolderName(payload);
+  if (!response.ok || payload.status !== 'success' || !accountName) {
+    const error = new Error(payload?.message || 'Flutterwave could not verify this bank account.');
+    error.statusCode = response.status >= 400 && response.status < 500 ? 400 : 502;
+    throw error;
   }
 
-  return payload.data || {};
+  return { bank, accountNumber: normalizedAccountNumber, accountName, country };
 }
 
 function getMissingR2Settings() {
@@ -566,6 +628,74 @@ async function storeInR2(file, folder, userId) {
     resourceType: file.mimetype.startsWith('video/') ? 'video' : 'image',
     format: path.extname(file.originalname).slice(1).toLowerCase(),
   };
+}
+
+function collectOwnedCourseMediaKeys(courseData, lessonDocuments, tutorId) {
+  const allowedPrefixes = [
+    `klaso/lessons/${tutorId}/`,
+    `klaso/media/${tutorId}/`,
+  ];
+  const mediaKeys = new Set();
+  const addKey = (value) => {
+    if (typeof value !== 'string' || !value.trim()) return;
+    const key = value.trim();
+    if (
+      key.includes('..')
+      || key.includes('\\')
+      || !allowedPrefixes.some((prefix) => key.startsWith(prefix))
+    ) {
+      const error = new Error('A tutorial references media that is not owned by this tutor.');
+      error.statusCode = 409;
+      throw error;
+    }
+    mediaKeys.add(key);
+  };
+  const addUrl = (value) => {
+    if (typeof value !== 'string' || !value.trim() || !process.env.R2_PUBLIC_URL) return;
+    let mediaUrl;
+    let publicUrl;
+    try {
+      mediaUrl = new URL(value);
+      publicUrl = new URL(process.env.R2_PUBLIC_URL);
+    } catch {
+      return;
+    }
+    if (mediaUrl.origin !== publicUrl.origin) return;
+
+    const basePath = publicUrl.pathname.replace(/\/+$/, '');
+    if (basePath && !mediaUrl.pathname.startsWith(`${basePath}/`)) return;
+    const encodedKey = basePath
+      ? mediaUrl.pathname.slice(basePath.length + 1)
+      : mediaUrl.pathname.replace(/^\/+/, '');
+    let key;
+    try {
+      key = decodeURIComponent(encodedKey);
+    } catch {
+      const error = new Error('A tutorial contains an invalid media URL.');
+      error.statusCode = 409;
+      throw error;
+    }
+    addKey(key);
+  };
+  const addAssets = (asset) => {
+    if (!asset || typeof asset !== 'object') return;
+    for (const keyField of ['videoKey', 'thumbnailKey']) addKey(asset[keyField]);
+    for (const urlField of ['videoUrl', 'thumbnailUrl', 'image', 'imageUrl']) addUrl(asset[urlField]);
+  };
+
+  addAssets(courseData);
+  if (Array.isArray(courseData.curriculum)) courseData.curriculum.forEach(addAssets);
+  lessonDocuments.forEach((lessonDocument) => addAssets(lessonDocument.data()));
+  return [...mediaKeys];
+}
+
+async function deleteFirestoreDocuments(documentReferences) {
+  const uniqueReferences = [...new Map(documentReferences.map((reference) => [reference.path, reference])).values()];
+  for (let offset = 0; offset < uniqueReferences.length; offset += 450) {
+    const batch = firebaseDb.batch();
+    uniqueReferences.slice(offset, offset + 450).forEach((reference) => batch.delete(reference));
+    await batch.commit();
+  }
 }
 
 async function removeTemporaryFile(file) {
@@ -694,12 +824,16 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
   }
 
   try {
-    const courseSnapshot = await firebaseDb.collection('courses').doc(tutorialId).get();
+    const courseRef = firebaseDb.collection('courses').doc(tutorialId);
+    const courseSnapshot = await courseRef.get();
     if (!courseSnapshot.exists) {
       return res.status(404).json({ error: 'Tutorial not found.' });
     }
 
     const courseData = courseSnapshot.data() || {};
+    if (courseData.deletionStatus === 'deleting') {
+      return res.status(409).json({ error: 'This tutorial is being deleted and cannot be purchased.' });
+    }
     const amount = parseMoney(courseData.price);
     if (!amount) {
       return res.status(400).json({ error: 'This tutorial has no valid price set yet.' });
@@ -727,6 +861,31 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
     const transactionDocRef = getTransactionDocRef(txRef);
     const tutorId = String(courseData.createdBy || courseData.tutorId || courseData.tutor?.uid || '');
     const redirectUrl = process.env.FLW_REDIRECT_URL || 'klaso://checkout';
+    await firebaseDb.runTransaction(async (transaction) => {
+      const currentCourseSnapshot = await transaction.get(courseRef);
+      if (!currentCourseSnapshot.exists || currentCourseSnapshot.data().deletionStatus === 'deleting') {
+        const error = new Error('This tutorial is being deleted and cannot be purchased.');
+        error.statusCode = 409;
+        throw error;
+      }
+
+      transaction.update(courseRef, { lastCheckoutAttemptAt: FieldValue.serverTimestamp() });
+      transaction.create(transactionDocRef, {
+        transactionId: transactionDocRef.id,
+        txRef,
+        studentId,
+        tutorId,
+        tutorialId,
+        amount,
+        currency: 'NGN',
+        status: 'initializing',
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        verifiedAt: null,
+        redirectUrl,
+      });
+    });
+
     const payload = {
       tx_ref: txRef,
       amount: Number(amount.toFixed(2)),
@@ -763,6 +922,11 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
     const flutterwaveResult = await flutterwaveResponse.json();
     if (!flutterwaveResponse.ok || flutterwaveResult.status !== 'success') {
       console.error('Flutterwave initialization failed:', flutterwaveResult);
+      await transactionDocRef.update({
+        status: 'failed',
+        failureReason: flutterwaveResult?.message || 'Flutterwave payment initialization failed.',
+        updatedAt: FieldValue.serverTimestamp(),
+      });
       return res.status(502).json({
         error: flutterwaveResult?.message || 'Unable to initialize payment with Flutterwave.',
       });
@@ -770,25 +934,20 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
 
     const paymentLink = flutterwaveResult.data?.link || flutterwaveResult.data?.checkout_url || null;
     if (!paymentLink) {
+      await transactionDocRef.update({
+        status: 'failed',
+        failureReason: 'Flutterwave did not return a checkout link.',
+        updatedAt: FieldValue.serverTimestamp(),
+      });
       return res.status(502).json({ error: 'Flutterwave did not return a valid checkout link.' });
     }
 
-    await transactionDocRef.set({
-      transactionId: transactionDocRef.id,
-      txRef,
-      studentId,
-      tutorId,
-      tutorialId,
-      amount,
-      currency: 'NGN',
+    await transactionDocRef.update({
       status: 'pending',
       flutterwaveTransactionId: flutterwaveResult.data?.id ? String(flutterwaveResult.data.id) : '',
-      createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
-      verifiedAt: null,
-      redirectUrl,
       paymentLink,
-    }, { merge: false });
+    });
 
     return res.json({
       ok: true,
@@ -802,7 +961,7 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
     });
   } catch (error) {
     console.error('Unable to initialize payment:', error);
-    return res.status(500).json({ error: 'Unable to initialize payment.' });
+    return res.status(error.statusCode || 500).json({ error: error.message || 'Unable to initialize payment.' });
   }
 });
 
@@ -1041,35 +1200,17 @@ app.get('/api/wallet/summary', authenticateFirebaseUser, requireTutorAccess, asy
 
 app.get('/api/wallet/banks', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
   try {
-    if (!process.env.FLW_SECRET_KEY) {
-      return res.status(503).json({ error: 'Flutterwave is not configured on this server.' });
-    }
-
-    const response = await fetch(getBankListUrl('NG'), {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${process.env.FLW_SECRET_KEY}`,
-        Accept: 'application/json',
-      },
-    });
-
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(payload?.message || 'Unable to load supported banks.');
-    }
-
-    const banks = Array.isArray(payload.data) ? payload.data : [];
-    return res.json({
+    const banks = await getFlutterwaveBanks('NG');
+    return res.status(200).json({
       ok: true,
-      banks: banks.map((bank) => ({
-        code: bank.code,
-        name: bank.name,
-        country: bank.country || 'NG',
-      })),
+      banks,
     });
   } catch (error) {
     console.error('Unable to load Flutterwave banks:', error);
-    return res.status(500).json({ error: 'Unable to load supported banks.' });
+    return res.status(error.statusCode || 502).json({
+      error: error.message || 'Unable to load supported banks.',
+      banks: [],
+    });
   }
 });
 
@@ -1082,122 +1223,231 @@ app.post('/api/wallet/banks/resolve', authenticateFirebaseUser, requireTutorAcce
 
   try {
     const resolved = await resolveFlutterwaveBankAccount(bankCode, accountNumber, country);
-    return res.json({
+    return res.status(200).json({
       ok: true,
       account: {
-        bankCode,
-        accountNumber: String(accountNumber).trim(),
-        accountName: resolved.account_name || resolved.accountName || '',
-        resolved: Boolean(resolved.account_name || resolved.accountName),
+        bankCode: resolved.bank.code,
+        accountName: resolved.accountName,
+        resolved: true,
       },
     });
   } catch (error) {
-    console.error('Unable to resolve bank account:', error);
-    return res.status(400).json({ error: error.message || 'Unable to resolve the bank account.' });
+    console.error('Unable to resolve bank account:', error.message);
+    return res.status(error.statusCode || 502).json({
+      error: error.message || 'Unable to resolve the bank account.',
+    });
   }
 });
 
 app.post('/api/wallet/bank-accounts', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
-  const { bankCode, bankName, accountNumber, country = 'NG', currency = 'NGN', isDefault = false } = req.body || {};
+  const { bankCode, accountNumber, country = 'NG', isDefault = false } = req.body || {};
 
-  if (!bankCode || !bankName || !accountNumber) {
-    return res.status(400).json({ error: 'Bank details are incomplete.' });
+  if (!bankCode || !accountNumber) {
+    return res.status(400).json({ error: 'Choose a bank and provide an account number.' });
   }
 
   try {
+    const encryptionKey = requireBankEncryptionKey(process.env.BANK_ACCOUNT_ENCRYPTION_KEY);
     const resolved = await resolveFlutterwaveBankAccount(bankCode, accountNumber, country);
-    const accountName = resolved.account_name || resolved.accountName || '';
-    if (!accountName) {
-      return res.status(400).json({ error: 'Unable to verify the bank account holder name.' });
-    }
-
-    const accountRef = firebaseDb.collection('tutorBankAccounts').doc();
+    const bankCodeValue = resolved.bank.code;
+    const accountFingerprint = fingerprintAccountNumber(
+      req.auth.uid,
+      bankCodeValue,
+      resolved.accountNumber,
+      encryptionKey
+    );
+    const accountRef = firebaseDb.collection('tutorBankAccounts').doc(accountFingerprint);
     const payload = {
       bankAccountId: accountRef.id,
       tutorId: req.auth.uid,
-      bankCode: String(bankCode).trim(),
-      bankName: String(bankName).trim(),
-      accountNumberEncrypted: String(accountNumber).trim(),
-      accountName,
-      country: String(country || 'NG').trim(),
-      currency: String(currency || 'NGN').trim().toUpperCase(),
+      bankCode: bankCodeValue,
+      bankName: resolved.bank.name,
+      accountNumberEncrypted: encryptAccountNumber(resolved.accountNumber, encryptionKey),
+      accountNumberFingerprint: accountFingerprint,
+      accountName: resolved.accountName,
+      country: resolved.country,
+      currency: 'NGN',
       isVerified: true,
-      isDefault: Boolean(isDefault),
-      accountNumberMasked: maskAccountNumber(accountNumber),
+      isDefault: false,
+      accountNumberMasked: maskAccountNumber(resolved.accountNumber),
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
     };
+    let duplicateAccountId = '';
+    let savedAccount = null;
+    const tutorAccountsQuery = firebaseDb
+      .collection('tutorBankAccounts')
+      .where('tutorId', '==', req.auth.uid);
 
-    await accountRef.set(payload);
+    await firebaseDb.runTransaction(async (transaction) => {
+      const [accountSnapshot, accountsSnapshot] = await Promise.all([
+        transaction.get(accountRef),
+        transaction.get(tutorAccountsQuery),
+      ]);
+      if (accountSnapshot.exists) {
+        duplicateAccountId = accountRef.id;
+        return;
+      }
+      const duplicate = accountsSnapshot.docs.find((docSnap) => {
+        const existing = docSnap.data();
+        if (existing.accountFingerprint === accountFingerprint) return true;
+        return existing.bankCode === bankCodeValue
+          && typeof existing.accountNumberEncrypted === 'string'
+          && existing.accountNumberEncrypted === resolved.accountNumber;
+      });
 
-    if (Boolean(isDefault)) {
-      const existingAccounts = await firebaseDb
-        .collection('tutorBankAccounts')
-        .where('tutorId', '==', req.auth.uid)
-        .get();
+      if (duplicate) {
+        duplicateAccountId = duplicate.id;
+        return;
+      }
 
-      await Promise.all(
-        existingAccounts.docs
-          .filter((docSnap) => docSnap.id !== accountRef.id)
-          .map((docSnap) => docSnap.ref.update({ isDefault: false, updatedAt: FieldValue.serverTimestamp() }))
-      );
+      const shouldBeDefault = isDefault === true
+        || !accountsSnapshot.docs.some((docSnap) => docSnap.data().isDefault === true);
+      if (shouldBeDefault) {
+        accountsSnapshot.docs
+          .filter((docSnap) => docSnap.data().isDefault === true)
+          .forEach((docSnap) => transaction.update(docSnap.ref, {
+            isDefault: false,
+            updatedAt: FieldValue.serverTimestamp(),
+          }));
+      }
+      payload.isDefault = shouldBeDefault;
+      transaction.create(accountRef, payload);
+      savedAccount = serializeBankAccount(accountRef.id, payload);
+    });
+
+    if (duplicateAccountId) {
+      return res.status(409).json({ error: 'This bank account is already saved.' });
     }
-
-    return res.json({ ok: true, account: payload });
+    return res.status(201).json({ ok: true, account: savedAccount });
   } catch (error) {
-    console.error('Unable to save tutor bank account:', error);
-    return res.status(400).json({ error: error.message || 'Unable to save the bank account.' });
+    console.error('Unable to save tutor bank account:', error.message);
+    return res.status(error.statusCode || (error.code ? 500 : 502)).json({
+      error: error.message || 'Unable to save the bank account.',
+    });
   }
 });
 
 app.get('/api/wallet/bank-accounts', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
-  const snapshot = await firebaseDb
-    .collection('tutorBankAccounts')
-    .where('tutorId', '==', req.auth.uid)
-    .orderBy('createdAt', 'desc')
-    .get();
+  try {
+    const encryptionKey = requireBankEncryptionKey(process.env.BANK_ACCOUNT_ENCRYPTION_KEY);
+    const snapshot = await firebaseDb
+      .collection('tutorBankAccounts')
+      .where('tutorId', '==', req.auth.uid)
+      .get();
 
-  return res.json({
-    ok: true,
-    accounts: snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
-  });
+    const accounts = await Promise.all(snapshot.docs.map(async (docSnap) => {
+      const account = docSnap.data();
+      if (typeof account.accountNumberEncrypted === 'string') {
+        const accountNumber = account.accountNumberEncrypted;
+        const encrypted = encryptAccountNumber(accountNumber, encryptionKey);
+        const accountFingerprint = fingerprintAccountNumber(
+          req.auth.uid,
+          String(account.bankCode || ''),
+          accountNumber,
+          encryptionKey
+        );
+        const accountNumberMasked = maskAccountNumber(accountNumber);
+        await docSnap.ref.update({
+          accountNumberEncrypted: encrypted,
+          accountNumberFingerprint: accountFingerprint,
+          accountNumberMasked,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return serializeBankAccount(docSnap.id, { ...account, accountNumberMasked });
+      }
+      return serializeBankAccount(docSnap.id, account);
+    }));
+    accounts.sort((left, right) => getTimestampMillis(right.createdAt) - getTimestampMillis(left.createdAt));
+    return res.status(200).json({ ok: true, accounts });
+  } catch (error) {
+    console.error('Unable to load tutor bank accounts:', error.message);
+    return res.status(error.statusCode || 500).json({
+      error: error.message || 'Unable to load saved bank accounts.',
+      accounts: [],
+    });
+  }
 });
 
 app.put('/api/wallet/bank-accounts/:id/default', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
   const accountId = req.params.id;
   const accountRef = firebaseDb.collection('tutorBankAccounts').doc(accountId);
-  const accountSnap = await accountRef.get();
-
-  if (!accountSnap.exists || accountSnap.data().tutorId !== req.auth.uid) {
-    return res.status(404).json({ error: 'Bank account not found.' });
-  }
-
-  const existingAccounts = await firebaseDb
+  const tutorAccountsQuery = firebaseDb
     .collection('tutorBankAccounts')
-    .where('tutorId', '==', req.auth.uid)
-    .get();
+    .where('tutorId', '==', req.auth.uid);
 
-  await Promise.all(
-    existingAccounts.docs.map((docSnap) => docSnap.ref.update({
-      isDefault: docSnap.id === accountId,
-      updatedAt: FieldValue.serverTimestamp(),
-    }))
-  );
+  try {
+    let accountFound = false;
+    await firebaseDb.runTransaction(async (transaction) => {
+      const [accountSnapshot, accountsSnapshot] = await Promise.all([
+        transaction.get(accountRef),
+        transaction.get(tutorAccountsQuery),
+      ]);
+      if (!accountSnapshot.exists || accountSnapshot.data().tutorId !== req.auth.uid) return;
+      accountFound = true;
+      accountsSnapshot.docs.forEach((docSnap) => transaction.update(docSnap.ref, {
+        isDefault: docSnap.id === accountId,
+        updatedAt: FieldValue.serverTimestamp(),
+      }));
+    });
 
-  return res.json({ ok: true, accountId });
+    if (!accountFound) return res.status(404).json({ error: 'Bank account not found.' });
+    return res.status(200).json({ ok: true, accountId });
+  } catch (error) {
+    console.error('Unable to update default bank account:', error);
+    return res.status(500).json({ error: 'Unable to update the default bank account.' });
+  }
 });
 
 app.delete('/api/wallet/bank-accounts/:id', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
   const accountId = req.params.id;
   const accountRef = firebaseDb.collection('tutorBankAccounts').doc(accountId);
-  const accountSnap = await accountRef.get();
+  const tutorAccountsQuery = firebaseDb
+    .collection('tutorBankAccounts')
+    .where('tutorId', '==', req.auth.uid);
+  const withdrawalsQuery = firebaseDb
+    .collection('withdrawals')
+    .where('tutorId', '==', req.auth.uid);
 
-  if (!accountSnap.exists || accountSnap.data().tutorId !== req.auth.uid) {
-    return res.status(404).json({ error: 'Bank account not found.' });
+  try {
+    let accountFound = false;
+    let hasActiveWithdrawal = false;
+    await firebaseDb.runTransaction(async (transaction) => {
+      const [accountSnapshot, accountsSnapshot, withdrawalsSnapshot] = await Promise.all([
+        transaction.get(accountRef),
+        transaction.get(tutorAccountsQuery),
+        transaction.get(withdrawalsQuery),
+      ]);
+      if (!accountSnapshot.exists || accountSnapshot.data().tutorId !== req.auth.uid) return;
+      accountFound = true;
+      hasActiveWithdrawal = withdrawalsSnapshot.docs.some((docSnap) => {
+        const withdrawal = docSnap.data();
+        return withdrawal.bankAccountId === accountId
+          && ['pending', 'processing'].includes(String(withdrawal.status || '').toLowerCase());
+      });
+      if (hasActiveWithdrawal) return;
+
+      transaction.delete(accountRef);
+      if (accountSnapshot.data().isDefault === true) {
+        const replacement = accountsSnapshot.docs.find((docSnap) => docSnap.id !== accountId);
+        accountsSnapshot.docs
+          .filter((docSnap) => docSnap.id !== accountId)
+          .forEach((docSnap) => transaction.update(docSnap.ref, {
+            isDefault: docSnap.id === replacement?.id,
+            updatedAt: FieldValue.serverTimestamp(),
+          }));
+      }
+    });
+
+    if (!accountFound) return res.status(404).json({ error: 'Bank account not found.' });
+    if (hasActiveWithdrawal) {
+      return res.status(409).json({ error: 'This account is linked to a pending withdrawal and cannot be removed yet.' });
+    }
+    return res.status(200).json({ ok: true, deleted: true, accountId });
+  } catch (error) {
+    console.error('Unable to remove bank account:', error);
+    return res.status(500).json({ error: 'Unable to remove the bank account.' });
   }
-
-  await accountRef.delete();
-  return res.json({ ok: true, deleted: true, accountId });
 });
 
 app.post('/api/wallet/withdraw', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
@@ -1227,6 +1477,17 @@ app.post('/api/wallet/withdraw', authenticateFirebaseUser, requireTutorAccess, a
 
   if (!bankSnap.exists || bankSnap.data().tutorId !== req.auth.uid || bankSnap.data().isVerified !== true) {
     return res.status(400).json({ error: 'The selected bank account is invalid or not verified.' });
+  }
+
+  let destinationAccountNumber;
+  try {
+    destinationAccountNumber = decryptAccountNumber(
+      bankSnap.data().accountNumberEncrypted,
+      requireBankEncryptionKey(process.env.BANK_ACCOUNT_ENCRYPTION_KEY)
+    );
+  } catch (error) {
+    console.error('Unable to decrypt payout account number:', error.message);
+    return res.status(503).json({ error: 'Payout account encryption is unavailable. Contact support.' });
   }
 
   const walletSnapshot = await walletRef.get();
@@ -1260,7 +1521,18 @@ app.post('/api/wallet/withdraw', authenticateFirebaseUser, requireTutorAccess, a
     };
 
     await firebaseDb.runTransaction(async (transaction) => {
-      const currentWallet = (await transaction.get(walletRef)).data() || {};
+      const [currentWalletSnapshot, currentBankSnapshot] = await Promise.all([
+        transaction.get(walletRef),
+        transaction.get(bankAccountRef),
+      ]);
+      if (
+        !currentBankSnapshot.exists
+        || currentBankSnapshot.data().tutorId !== req.auth.uid
+        || currentBankSnapshot.data().isVerified !== true
+      ) {
+        throw new Error('The selected bank account is invalid or not verified.');
+      }
+      const currentWallet = currentWalletSnapshot.data() || {};
       const currentAvailable = Number(currentWallet.availableBalance || 0);
       const currentReserved = Number(currentWallet.reservedBalance || 0);
 
@@ -1298,7 +1570,7 @@ app.post('/api/wallet/withdraw', authenticateFirebaseUser, requireTutorAccess, a
       },
       body: JSON.stringify({
         account_bank: bankSnap.data().bankCode,
-        account_number: String(bankSnap.data().accountNumberEncrypted || '').trim(),
+        account_number: destinationAccountNumber,
         amount: Number(numericAmount.toFixed(2)),
         narration: 'Klaso tutor withdrawal',
         currency: String(currency || 'NGN').toUpperCase(),
@@ -1488,6 +1760,113 @@ app.delete('/api/delete-media', authenticateFirebaseUser, async (req, res) => {
   } catch (error) {
     console.error('R2 media deletion failed:', error);
     return res.status(500).json({ error: 'Media deletion failed.' });
+  }
+});
+
+app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
+  const courseId = String(req.params.id || '').trim();
+  if (!courseId) return res.status(400).json({ error: 'A tutorial ID is required.' });
+  if (!requireR2Configuration(res)) return;
+
+  const courseRef = firebaseDb.collection('courses').doc(courseId);
+  const purchasesQuery = firebaseDb.collection('purchases').where('tutorialId', '==', courseId);
+  const transactionsQuery = firebaseDb.collection('transactions').where('tutorialId', '==', courseId);
+  let courseData;
+
+  try {
+    await firebaseDb.runTransaction(async (transaction) => {
+      const [courseSnapshot, purchasesSnapshot, transactionsSnapshot] = await Promise.all([
+        transaction.get(courseRef),
+        transaction.get(purchasesQuery),
+        transaction.get(transactionsQuery),
+      ]);
+      if (!courseSnapshot.exists) {
+        const error = new Error('Tutorial not found.');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const candidate = courseSnapshot.data() || {};
+      const ownerId = String(candidate.createdBy || candidate.tutorId || candidate.tutor?.uid || '');
+      if (ownerId !== req.auth.uid) {
+        const error = new Error('You can only delete your own tutorials.');
+        error.statusCode = 404;
+        throw error;
+      }
+      if (!purchasesSnapshot.empty) {
+        const error = new Error('This tutorial has purchases and cannot be deleted.');
+        error.statusCode = 409;
+        throw error;
+      }
+
+      const terminalStatuses = new Set(['failed', 'cancelled', 'expired']);
+      const hasActivePayment = transactionsSnapshot.docs.some((transactionDocument) =>
+        !terminalStatuses.has(String(transactionDocument.data().status || '').toLowerCase())
+      );
+      if (hasActivePayment) {
+        const error = new Error('This tutorial has a payment in progress and cannot be deleted yet.');
+        error.statusCode = 409;
+        throw error;
+      }
+
+      courseData = candidate;
+      transaction.update(courseRef, {
+        deletionStatus: 'deleting',
+        deletionStartedBy: req.auth.uid,
+        deletionStartedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    });
+
+    const lessonDocumentsById = new Map();
+    const linkedLessons = await firebaseDb
+      .collection('lessons')
+      .where('courseId', '==', courseId)
+      .get();
+    linkedLessons.docs.forEach((lessonDocument) => lessonDocumentsById.set(lessonDocument.id, lessonDocument));
+
+    if (courseData.lessonId) {
+      const linkedLesson = await firebaseDb.collection('lessons').doc(String(courseData.lessonId)).get();
+      if (linkedLesson.exists) lessonDocumentsById.set(linkedLesson.id, linkedLesson);
+    }
+
+    const lessonDocuments = [...lessonDocumentsById.values()];
+    if (lessonDocuments.some((lessonDocument) => {
+      const lessonOwner = lessonDocument.data().createdBy;
+      return lessonOwner && lessonOwner !== req.auth.uid;
+    })) {
+      return res.status(409).json({ error: 'A linked lesson is owned by another tutor and cannot be deleted.' });
+    }
+
+    const mediaKeys = collectOwnedCourseMediaKeys(courseData, lessonDocuments, req.auth.uid);
+    const mediaResults = await Promise.allSettled(mediaKeys.map((key) =>
+      r2Client.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key }))
+    ));
+    const failedMediaCount = mediaResults.filter((result) => result.status === 'rejected').length;
+    if (failedMediaCount > 0) {
+      console.error(`Tutorial media cleanup failed for ${failedMediaCount} R2 objects.`, { courseId });
+      return res.status(502).json({
+        error: 'Some tutorial media could not be deleted. Retry deleting this tutorial to finish cleanup.',
+        remainingMedia: failedMediaCount,
+      });
+    }
+
+    const reviewSnapshot = await courseRef.collection('reviews').get();
+    await deleteFirestoreDocuments([
+      ...lessonDocuments.map((lessonDocument) => lessonDocument.ref),
+      ...reviewSnapshot.docs.map((reviewDocument) => reviewDocument.ref),
+      courseRef,
+    ]);
+
+    return res.status(200).json({
+      ok: true,
+      deleted: true,
+      deletedLessonCount: lessonDocuments.length,
+      deletedMediaCount: mediaKeys.length,
+    });
+  } catch (error) {
+    console.error('Unable to delete tutor tutorial:', error.message, { courseId });
+    return res.status(error.statusCode || 500).json({ error: error.message || 'Unable to delete this tutorial.' });
   }
 });
 
