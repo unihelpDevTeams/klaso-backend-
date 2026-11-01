@@ -116,6 +116,21 @@ function getPurchaseDocRef(txRef) {
   return firebaseDb.collection('purchases').doc(`purchase_${String(txRef || '').trim()}`);
 }
 
+function getTimestampMillis(value) {
+  if (typeof value?.toMillis === 'function') {
+    return value.toMillis();
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sortWalletTransactions(documents) {
+  return documents
+    .map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }))
+    .sort((left, right) => getTimestampMillis(right.createdAt) - getTimestampMillis(left.createdAt));
+}
+
 function generateTxRef(prefix = 'KLS') {
   const suffix = randomUUID().replace(/-/g, '').slice(0, 12).toUpperCase();
   return `${prefix}_${Date.now()}_${suffix}`;
@@ -964,12 +979,11 @@ app.get('/api/tutor/insights', authenticateFirebaseUser, async (req, res) => {
 app.get('/api/wallet', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
   try {
     const wallet = await ensureTutorWallet(req.auth.uid);
-    const walletTransactions = await firebaseDb
+    const walletTransactionsSnapshot = await firebaseDb
       .collection('walletTransactions')
       .where('tutorId', '==', req.auth.uid)
-      .orderBy('createdAt', 'desc')
-      .limit(20)
       .get();
+    const walletTransactions = sortWalletTransactions(walletTransactionsSnapshot.docs).slice(0, 20);
 
     const summary = {
       totalEarnings: Number(wallet?.totalEarnings || 0),
@@ -978,7 +992,7 @@ app.get('/api/wallet', authenticateFirebaseUser, requireTutorAccess, async (req,
       reservedBalance: Number(wallet?.reservedBalance || 0),
       withdrawnAmount: Number(wallet?.withdrawnAmount || 0),
       totalTutorialsSold: 0,
-      lastTransactions: walletTransactions.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
+      lastTransactions: walletTransactions,
     };
 
     const purchasesSnapshot = await firebaseDb
@@ -999,12 +1013,11 @@ app.get('/api/wallet/transactions', authenticateFirebaseUser, requireTutorAccess
     const snapshot = await firebaseDb
       .collection('walletTransactions')
       .where('tutorId', '==', req.auth.uid)
-      .orderBy('createdAt', 'desc')
       .get();
 
     return res.json({
       ok: true,
-      transactions: snapshot.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() })),
+      transactions: sortWalletTransactions(snapshot.docs),
     });
   } catch (error) {
     console.error('Unable to fetch wallet transactions:', error);
