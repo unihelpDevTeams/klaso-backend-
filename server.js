@@ -203,6 +203,7 @@ async function ensureCourseAccess(studentId, tutorialId) {
   // enrollment record. Keep this server-side so every client receives the
   // same entitlement result.
   const courseSnapshot = await firebaseDb.collection('courses').doc(tutorialId).get();
+  if (courseSnapshot.exists && courseSnapshot.data()?.moderationStatus === 'restricted') return false;
   if (courseSnapshot.exists && Number(courseSnapshot.data()?.price) === 0) return true;
 
   const purchaseSnapshot = await firebaseDb
@@ -800,6 +801,12 @@ app.post('/api/payments/initialize', authenticateFirebaseUser, async (req, res) 
     }
 
     const courseData = courseSnapshot.data() || {};
+    if (courseData.lifecycleStatus === 'retired') {
+      return res.status(410).json({ error: 'This tutorial is no longer available for new purchase.' });
+    }
+    if (courseData.moderationStatus === 'restricted') {
+      return res.status(403).json({ error: 'This tutorial is currently unavailable.' });
+    }
     if (courseData.deletionStatus === 'deleting') {
       return res.status(409).json({ error: 'This tutorial is being deleted and cannot be purchased.' });
     }
@@ -1790,32 +1797,27 @@ app.post('/api/admin/tutorial-reports/:reportId/actions', authenticateFirebaseUs
     if (action === 'remove_tutor') {
       if (!tutorId) return res.status(400).json({ error: 'The tutorial owner could not be identified.' });
       const tutorCourses = await firebaseDb.collection('courses').where('createdBy', '==', tutorId).get();
-      const batch = firebaseDb.batch();
-      batch.set(firebaseDb.collection('users').doc(tutorId), {
-        role: 'student',
-        approved: false,
-        tutorRestrictedAt: FieldValue.serverTimestamp(),
-        tutorRestrictedBy: req.auth.uid,
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-      batch.set(firebaseDb.collection('tutorProfiles').doc(tutorId), {
-        approved: false,
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-      tutorCourses.docs.forEach((course) => batch.update(course.ref, {
-        moderationStatus: 'restricted',
-        restrictedAt: FieldValue.serverTimestamp(),
-        restrictedBy: req.auth.uid,
-        updatedAt: FieldValue.serverTimestamp(),
-      }));
-      batch.update(reportRef, {
-        status: 'resolved',
-        resolution: 'tutor_removed',
-        reviewedBy: req.auth.uid,
-        reviewedAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      await batch.commit();
+      for (let offset = 0; offset < Math.max(tutorCourses.docs.length, 1); offset += 450) {
+        const batch = firebaseDb.batch();
+        if (offset === 0) {
+          batch.set(firebaseDb.collection('users').doc(tutorId), {
+            role: 'student', approved: false, tutorRestrictedAt: FieldValue.serverTimestamp(),
+            tutorRestrictedBy: req.auth.uid, updatedAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
+          batch.set(firebaseDb.collection('tutorProfiles').doc(tutorId), {
+            approved: false, updatedAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
+          batch.update(reportRef, {
+            status: 'resolved', resolution: 'tutor_removed', reviewedBy: req.auth.uid,
+            reviewedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
+          });
+        }
+        tutorCourses.docs.slice(offset, offset + 450).forEach((course) => batch.update(course.ref, {
+          moderationStatus: 'restricted', restrictedAt: FieldValue.serverTimestamp(),
+          restrictedBy: req.auth.uid, updatedAt: FieldValue.serverTimestamp(),
+        }));
+        await batch.commit();
+      }
       return res.json({ ok: true, message: 'Tutor removed and their tutorials restricted.' });
     }
 
@@ -1884,20 +1886,22 @@ app.delete('/api/delete-media', authenticateFirebaseUser, async (req, res) => {
 app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAccess, async (req, res) => {
   const courseId = String(req.params.id || '').trim();
   if (!courseId) return res.status(400).json({ error: 'A tutorial ID is required.' });
-  if (!requireR2Configuration(res)) return;
 
   const courseRef = firebaseDb.collection('courses').doc(courseId);
   const purchasesQuery = firebaseDb.collection('purchases').where('tutorialId', '==', courseId);
+  const enrollmentsQuery = firebaseDb.collection('enrollments').where('courseId', '==', courseId);
   const transactionsQuery = firebaseDb.collection('transactions').where('tutorialId', '==', courseId);
   let courseData;
+  let retiredInsteadOfDeleted = false;
   let deletionLockSet = false;
   let mediaCleanupStarted = false;
 
   try {
     await firebaseDb.runTransaction(async (transaction) => {
-      const [courseSnapshot, purchasesSnapshot, transactionsSnapshot] = await Promise.all([
+      const [courseSnapshot, purchasesSnapshot, enrollmentsSnapshot, transactionsSnapshot] = await Promise.all([
         transaction.get(courseRef),
         transaction.get(purchasesQuery),
+        transaction.get(enrollmentsQuery),
         transaction.get(transactionsQuery),
       ]);
       if (!courseSnapshot.exists) {
@@ -1913,12 +1917,6 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
         error.statusCode = 404;
         throw error;
       }
-      if (candidate.deletionStatus !== 'deleting' && !purchasesSnapshot.empty) {
-        const error = new Error('This tutorial has purchases and cannot be deleted.');
-        error.statusCode = 409;
-        throw error;
-      }
-
       const terminalStatuses = new Set(['failed', 'cancelled', 'expired']);
       const hasActivePayment = candidate.deletionStatus !== 'deleting' && transactionsSnapshot.docs.some((transactionDocument) =>
         !terminalStatuses.has(String(transactionDocument.data().status || '').toLowerCase())
@@ -1930,6 +1928,20 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
       }
 
       courseData = candidate;
+      // Lifetime access must survive a creator's deletion request. Retire the
+      // listing instead of deleting its media whenever somebody has purchased
+      // or been enrolled in it; those learners can still stream it by ID.
+      if (!purchasesSnapshot.empty || !enrollmentsSnapshot.empty) {
+        retiredInsteadOfDeleted = true;
+        transaction.update(courseRef, {
+          lifecycleStatus: 'retired',
+          retiredAt: FieldValue.serverTimestamp(),
+          retiredBy: req.auth.uid,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return;
+      }
+
       transaction.update(courseRef, {
         deletionStatus: 'deleting',
         deletionStartedBy: req.auth.uid,
@@ -1938,6 +1950,17 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
       });
     });
     deletionLockSet = true;
+
+    if (retiredInsteadOfDeleted) {
+      return res.status(200).json({
+        ok: true,
+        retired: true,
+        deleted: false,
+        message: 'Tutorial retired from the catalog. Existing learners keep lifetime access.',
+      });
+    }
+
+    if (!requireR2Configuration(res)) return;
 
     const lessonDocumentsById = new Map();
     const linkedLessons = await firebaseDb
