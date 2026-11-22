@@ -204,10 +204,17 @@ async function ensureCourseAccess(studentId, tutorialId) {
   // same entitlement result.
   const courseSnapshot = await firebaseDb.collection('courses').doc(tutorialId).get();
   if (!courseSnapshot.exists) return false;
-  if (courseSnapshot.exists && courseSnapshot.data()?.moderationStatus === 'restricted') return false;
+  const courseData = courseSnapshot.data() || {};
+  // Moderation restrictions are intentionally enforced for every account,
+  // including the uploader, until an administrator resolves the review.
+  if (courseData.moderationStatus === 'restricted') return false;
+
+  const ownerId = String(courseData.createdBy || courseData.tutorId || courseData.tutor?.uid || '');
+  if (ownerId && ownerId === studentId) return true;
+
   // Retired free content is no longer public. A paid learner still reaches the
   // purchase/enrollment checks below and keeps their original entitlement.
-  if (courseSnapshot.exists && courseSnapshot.data()?.lifecycleStatus !== 'retired' && Number(courseSnapshot.data()?.price) === 0) return true;
+  if (courseData.lifecycleStatus !== 'retired' && Number(courseData.price) === 0) return true;
 
   const purchaseSnapshot = await firebaseDb
     .collection('purchases')
