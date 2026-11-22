@@ -1747,6 +1747,111 @@ app.post('/api/admin/tutor-credentials/:userId/review-link', authenticateFirebas
   }
 });
 
+app.post('/api/admin/tutorial-reports/:reportId/actions', authenticateFirebaseUser, requireConfiguredAdmin, async (req, res) => {
+  const reportId = String(req.params.reportId || '').trim();
+  const action = String(req.body?.action || '').trim();
+  if (!reportId || !['restrict', 'delete', 'remove_tutor'].includes(action)) {
+    return res.status(400).json({ error: 'A valid report and moderation action are required.' });
+  }
+
+  try {
+    const reportRef = firebaseDb.collection('tutorialReports').doc(reportId);
+    const reportSnapshot = await reportRef.get();
+    if (!reportSnapshot.exists) return res.status(404).json({ error: 'Tutorial report not found.' });
+
+    const report = reportSnapshot.data() || {};
+    const courseId = String(report.courseId || report.tutorialId || '').trim();
+    if (!courseId) return res.status(400).json({ error: 'This report has no tutorial reference.' });
+    const courseRef = firebaseDb.collection('courses').doc(courseId);
+    const courseSnapshot = await courseRef.get();
+    if (!courseSnapshot.exists && action !== 'delete') return res.status(404).json({ error: 'Tutorial not found.' });
+    const courseData = courseSnapshot.exists ? courseSnapshot.data() || {} : {};
+    const tutorId = String(report.tutorId || courseData.createdBy || courseData.tutorId || courseData.tutor?.uid || '').trim();
+
+    if (action === 'restrict') {
+      await firebaseDb.runTransaction(async (transaction) => {
+        transaction.update(courseRef, {
+          moderationStatus: 'restricted',
+          restrictedAt: FieldValue.serverTimestamp(),
+          restrictedBy: req.auth.uid,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        transaction.update(reportRef, {
+          status: 'resolved',
+          resolution: 'tutorial_restricted',
+          reviewedBy: req.auth.uid,
+          reviewedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      });
+      return res.json({ ok: true, message: 'Tutorial restricted from the player.' });
+    }
+
+    if (action === 'remove_tutor') {
+      if (!tutorId) return res.status(400).json({ error: 'The tutorial owner could not be identified.' });
+      const tutorCourses = await firebaseDb.collection('courses').where('createdBy', '==', tutorId).get();
+      const batch = firebaseDb.batch();
+      batch.set(firebaseDb.collection('users').doc(tutorId), {
+        role: 'student',
+        approved: false,
+        tutorRestrictedAt: FieldValue.serverTimestamp(),
+        tutorRestrictedBy: req.auth.uid,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      batch.set(firebaseDb.collection('tutorProfiles').doc(tutorId), {
+        approved: false,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      tutorCourses.docs.forEach((course) => batch.update(course.ref, {
+        moderationStatus: 'restricted',
+        restrictedAt: FieldValue.serverTimestamp(),
+        restrictedBy: req.auth.uid,
+        updatedAt: FieldValue.serverTimestamp(),
+      }));
+      batch.update(reportRef, {
+        status: 'resolved',
+        resolution: 'tutor_removed',
+        reviewedBy: req.auth.uid,
+        reviewedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      await batch.commit();
+      return res.json({ ok: true, message: 'Tutor removed and their tutorials restricted.' });
+    }
+
+    if (!courseSnapshot.exists) {
+      await reportRef.set({ status: 'resolved', resolution: 'tutorial_already_deleted', reviewedBy: req.auth.uid, reviewedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+      return res.json({ ok: true, message: 'Tutorial was already deleted.' });
+    }
+    if (!tutorId) return res.status(400).json({ error: 'The tutorial owner could not be identified.' });
+    if (!requireR2Configuration(res)) return;
+
+    const lessonsSnapshot = await firebaseDb.collection('lessons').where('courseId', '==', courseId).get();
+    const mediaKeys = collectOwnedTutorialMediaKeys(
+      courseData,
+      lessonsSnapshot.docs.map((lesson) => lesson.data()),
+      tutorId,
+      process.env.R2_PUBLIC_URL
+    );
+    for (const key of mediaKeys) {
+      await r2Client.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key }));
+    }
+    const reviewsSnapshot = await courseRef.collection('reviews').get();
+    await deleteFirestoreDocuments([...lessonsSnapshot.docs.map((lesson) => lesson.ref), ...reviewsSnapshot.docs.map((review) => review.ref), courseRef]);
+    await reportRef.set({
+      status: 'resolved',
+      resolution: 'tutorial_deleted',
+      reviewedBy: req.auth.uid,
+      reviewedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return res.json({ ok: true, message: 'Tutorial and uploaded media deleted.' });
+  } catch (error) {
+    console.error('Unable to apply tutorial moderation action:', error);
+    return res.status(error.statusCode || 500).json({ error: error.message || 'Unable to apply this moderation action.' });
+  }
+});
+
 app.delete('/api/delete-media', authenticateFirebaseUser, async (req, res) => {
   const key = req.body?.key;
 
