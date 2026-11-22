@@ -203,8 +203,11 @@ async function ensureCourseAccess(studentId, tutorialId) {
   // enrollment record. Keep this server-side so every client receives the
   // same entitlement result.
   const courseSnapshot = await firebaseDb.collection('courses').doc(tutorialId).get();
+  if (!courseSnapshot.exists) return false;
   if (courseSnapshot.exists && courseSnapshot.data()?.moderationStatus === 'restricted') return false;
-  if (courseSnapshot.exists && Number(courseSnapshot.data()?.price) === 0) return true;
+  // Retired free content is no longer public. A paid learner still reaches the
+  // purchase/enrollment checks below and keeps their original entitlement.
+  if (courseSnapshot.exists && courseSnapshot.data()?.lifecycleStatus !== 'retired' && Number(courseSnapshot.data()?.price) === 0) return true;
 
   const purchaseSnapshot = await firebaseDb
     .collection('purchases')
@@ -1917,7 +1920,9 @@ app.delete('/api/tutor/tutorials/:id', authenticateFirebaseUser, requireTutorAcc
         error.statusCode = 404;
         throw error;
       }
-      const terminalStatuses = new Set(['failed', 'cancelled', 'expired']);
+      // A completed purchase is not an in-flight checkout. It is precisely the
+      // case where we retire the catalog listing and preserve buyer access.
+      const terminalStatuses = new Set(['successful', 'failed', 'cancelled', 'expired']);
       const hasActivePayment = candidate.deletionStatus !== 'deleting' && transactionsSnapshot.docs.some((transactionDocument) =>
         !terminalStatuses.has(String(transactionDocument.data().status || '').toLowerCase())
       );
