@@ -15,8 +15,9 @@ import { collectOwnedTutorialMediaKeys } from './tutorialDeletionUtils.js';
 import { applicationDefault, cert, getApps, initializeApp } from 'firebase-admin/app';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
-import { S3Client, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -31,7 +32,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const uploadsDir = path.join(__dirname, 'tmp', 'uploads');
 const maxFileSize = 500 * 1024 * 1024;
-const allowedFolders = new Set(['klaso/lessons', 'klaso/profiles', 'klaso/media']);
+const allowedFolders = new Set(['klaso/lessons', 'klaso/profiles', 'klaso/media', 'klaso/credentials']);
 
 fs.mkdirSync(uploadsDir, { recursive: true });
 
@@ -81,7 +82,9 @@ const allowedMimeTypes = new Set([
   'video/webm',
   'video/3gpp',
   'video/x-m4v',
+  'application/pdf',
 ]);
+const credentialMimeTypes = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -98,7 +101,7 @@ const upload = multer({
       return;
     }
 
-    cb(new Error('Unsupported file type. Upload an image or supported video.'));
+    cb(new Error('Unsupported file type. Upload a PDF, image, or supported video.'));
   },
 });
 
@@ -195,6 +198,12 @@ async function verifyFlutterwavePaymentReference(txRef) {
 
 async function ensureCourseAccess(studentId, tutorialId) {
   if (!studentId || !tutorialId) return false;
+
+  // Free tutorials are intentionally available without creating a payment or
+  // enrollment record. Keep this server-side so every client receives the
+  // same entitlement result.
+  const courseSnapshot = await firebaseDb.collection('courses').doc(tutorialId).get();
+  if (courseSnapshot.exists && Number(courseSnapshot.data()?.price) === 0) return true;
 
   const purchaseSnapshot = await firebaseDb
     .collection('purchases')
@@ -702,7 +711,7 @@ async function authorizeMediaFolder(req, res, next) {
     return res.status(400).json({ error: 'Unsupported upload folder.' });
   }
 
-  if (folder === 'klaso/profiles' || req.auth.admin === true) {
+  if (folder === 'klaso/profiles' || folder === 'klaso/credentials' || req.auth.admin === true) {
     req.uploadFolder = folder;
     return next();
   }
@@ -711,6 +720,22 @@ async function authorizeMediaFolder(req, res, next) {
     req.uploadFolder = folder;
     return next();
   });
+}
+
+async function requireConfiguredAdmin(req, res, next) {
+  try {
+    const userRecord = await firebaseAuth.getUser(req.auth.uid);
+    const email = userRecord.email?.trim().toLowerCase();
+    const isAdmin =
+      typeof email === 'string' &&
+      userRecord.emailVerified === true &&
+      getConfiguredAdminEmails().includes(email);
+    if (!isAdmin) return res.status(403).json({ error: 'Administrator access is required.' });
+    return next();
+  } catch (error) {
+    console.error('Unable to verify administrator access:', error);
+    return res.status(500).json({ error: 'Unable to verify administrator access.' });
+  }
 }
 
 app.get('/', (_req, res) => {
@@ -1674,6 +1699,11 @@ app.post(
       return res.status(400).json({ error: 'No file provided.' });
     }
 
+    if (req.uploadFolder === 'klaso/credentials' && !credentialMimeTypes.has(file.mimetype)) {
+      await removeTemporaryFile(file);
+      return res.status(400).json({ error: 'Credentials must be a PDF, JPG, PNG, or WEBP file.' });
+    }
+
     if (!requireR2Configuration(res)) {
       await removeTemporaryFile(file);
       return;
@@ -1691,11 +1721,37 @@ app.post(
   }
 );
 
+app.post('/api/admin/tutor-credentials/:userId/review-link', authenticateFirebaseUser, requireConfiguredAdmin, async (req, res) => {
+  const applicantId = String(req.params.userId || '').trim();
+  if (!applicantId) return res.status(400).json({ error: 'Applicant ID is required.' });
+  if (!requireR2Configuration(res)) return;
+
+  try {
+    const applicantSnapshot = await firebaseDb.collection('users').doc(applicantId).get();
+    const credential = applicantSnapshot.data()?.credential;
+    const key = credential?.key;
+    const expectedPrefix = `klaso/credentials/${applicantId}/`;
+    if (typeof key !== 'string' || !key.startsWith(expectedPrefix) || key.includes('..')) {
+      return res.status(404).json({ error: 'No credential document is available for this application.' });
+    }
+
+    const reviewUrl = await getSignedUrl(
+      r2Client,
+      new GetObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key }),
+      { expiresIn: 5 * 60 }
+    );
+    return res.json({ url: reviewUrl, expiresIn: 300, name: credential.name || 'Tutor credential' });
+  } catch (error) {
+    console.error('Unable to create credential review link:', error);
+    return res.status(500).json({ error: 'Unable to open the credential document.' });
+  }
+});
+
 app.delete('/api/delete-media', authenticateFirebaseUser, async (req, res) => {
   const key = req.body?.key;
 
   const escapedUserId = req.auth.uid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const ownedObjectPrefix = `^klaso/(lessons|profiles|media)/${escapedUserId}/`;
+  const ownedObjectPrefix = `^klaso/(lessons|profiles|media|credentials)/${escapedUserId}/`;
   const canDeleteObject =
     typeof key === 'string' &&
     !key.includes('..') &&
